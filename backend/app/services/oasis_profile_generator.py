@@ -54,7 +54,13 @@ class OasisAgentProfile:
     # Source entity information
     source_entity_uuid: Optional[str] = None
     source_entity_type: Optional[str] = None
-    
+
+    # PufferFish traversal fields
+    domain_literacy: Optional[str] = None   # "low" | "medium" | "high"
+    mental_model: Optional[str] = None      # misconceptions / world model
+    task: Optional[str] = None             # goal the agent is trying to accomplish
+    entry_context: Optional[str] = None    # how they arrived at the product
+
     created_at: str = field(default_factory=lambda: datetime.now().strftime("%Y-%m-%d"))
     
     def to_reddit_format(self) -> Dict[str, Any]:
@@ -135,8 +141,40 @@ class OasisAgentProfile:
             "interested_topics": self.interested_topics,
             "source_entity_uuid": self.source_entity_uuid,
             "source_entity_type": self.source_entity_type,
+            "domain_literacy": self.domain_literacy,
+            "mental_model": self.mental_model,
+            "task": self.task,
+            "entry_context": self.entry_context,
             "created_at": self.created_at,
         }
+
+    @classmethod
+    def from_library_persona(cls, persona_dict: Dict[str, Any], user_id: int = 0) -> "OasisAgentProfile":
+        """
+        Construct an OasisAgentProfile directly from a persona library JSON entry
+        (defi.json, saas_b2b.json, etc.), bypassing the entity-graph flow.
+        """
+        return cls(
+            user_id=user_id,
+            user_name=persona_dict.get("agent_id", f"agent_{user_id}"),
+            name=persona_dict.get("name", f"Agent {user_id}"),
+            bio=persona_dict.get("bio", ""),
+            persona=persona_dict.get("persona", ""),
+            karma=persona_dict.get("karma", 1000),
+            friend_count=persona_dict.get("friend_count", 100),
+            follower_count=persona_dict.get("follower_count", 150),
+            statuses_count=persona_dict.get("statuses_count", 500),
+            age=persona_dict.get("age"),
+            gender=persona_dict.get("gender"),
+            mbti=persona_dict.get("mbti"),
+            country=persona_dict.get("country"),
+            profession=persona_dict.get("profession"),
+            interested_topics=persona_dict.get("interested_topics", []),
+            domain_literacy=persona_dict.get("domain_literacy"),
+            mental_model=persona_dict.get("mental_model"),
+            task=persona_dict.get("task"),
+            entry_context=persona_dict.get("entry_context"),
+        )
 
 
 class OasisProfileGenerator:

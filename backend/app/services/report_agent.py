@@ -548,6 +548,47 @@ Function Flow:
 
 # ── Outline Planning Prompt ──
 
+TRAVERSAL_PLAN_SYSTEM_PROMPT = """\
+You are an expert product analyst writing a PM report based on synthetic user testing.
+
+[Core Concept]
+We ran a product experience simulation: real user personas navigated a product flow screen by screen.
+Each agent has a specific persona, domain literacy, mental model, and task — and logged their
+comprehension score, trust score, confusion signals, and whether they abandoned at each step.
+
+[Your Task]
+Write a PM report that answers:
+1. Which user segments completed the flow and which dropped off?
+2. Where does comprehension break down — which screens confuse which users?
+3. What are the top friction points, ranked by severity and frequency?
+4. What should the product team change?
+
+[Report Structure]
+Write exactly these 5-6 sections:
+1. Executive Summary — Red/Amber/Green signal per cohort, one-paragraph verdict
+2. Task Completion Rates — who finished, who dropped off, and at what rate
+3. Comprehension Heatmap — screen-by-screen scores, where understanding breaks down
+4. Top Friction Points — ranked by severity × frequency, specific screen + specific confusion
+5. Cohort Divergence — where novices and power users split
+6. Recommendations — specific, actionable: copy changes, flow reordering, missing context
+
+[Tone]
+Write like a PM, not a researcher. Be direct. Rank things. Give specific recommendations.
+
+Please output the report outline in JSON format:
+{
+    "title": "Report Title",
+    "summary": "One-sentence verdict on the product flow",
+    "sections": [
+        {
+            "title": "Section Title",
+            "description": "Section content description"
+        }
+    ]
+}
+
+sections array must have 5-6 elements."""
+
 PLAN_SYSTEM_PROMPT = """\
 You are an expert in writing "future prediction reports" with a "god's eye view" of the simulated world - you can gain insights into the behavior, statements, and interactions of every agent in the simulation.
 
@@ -886,7 +927,8 @@ class ReportAgent:
         simulation_id: str,
         simulation_requirement: str,
         llm_client: Optional[LLMClient] = None,
-        graph_tools: Optional[GraphToolsService] = None
+        graph_tools: Optional[GraphToolsService] = None,
+        mode: str = "oasis",
     ):
         """
         Initialize Report Agent
@@ -897,10 +939,12 @@ class ReportAgent:
             simulation_requirement: Simulation requirement description
             llm_client: LLM client (optional)
             graph_tools: Graph tools service (optional, requires external GraphStorage injection)
+            mode: "oasis" (social simulation) or "traversal" (PufferFish product simulation)
         """
         self.graph_id = graph_id
         self.simulation_id = simulation_id
         self.simulation_requirement = simulation_requirement
+        self.mode = mode
 
         self.llm = llm_client or LLMClient()
         if graph_tools is None:
@@ -909,7 +953,7 @@ class ReportAgent:
                 "Create it via GraphToolsService(storage=...) and pass it in."
             )
         self.graph_tools = graph_tools
-        
+
         # Tool definitions
         self.tools = self._define_tools()
 
@@ -954,7 +998,27 @@ class ReportAgent:
                     "interview_topic": "Interview topic or requirement description (e.g. 'understand students' views on the dorm formaldehyde incident')",
                     "max_agents": "Maximum number of agents to interview (optional, default 5, max 10)"
                 }
-            }
+            },
+            # ── PufferFish traversal tools ──
+            "get_dropout_funnel": {
+                "name": "get_dropout_funnel",
+                "description": "[Dropout Funnel] Screen-by-screen abandonment rates across the product flow. Shows where users drop off and how many agents reached each screen. Call this first to understand the overall completion picture.",
+                "parameters": {
+                    "cohort_id": "Optional — filter to a specific persona cohort (e.g. 'defi'). Omit for all cohorts."
+                }
+            },
+            "get_comprehension_heatmap": {
+                "name": "get_comprehension_heatmap",
+                "description": "[Comprehension Heatmap] Average comprehension score (1-5) and trust score (1-5) per screen per cohort. Reveals which screens confuse which user segments. Call this to identify where understanding breaks down.",
+                "parameters": {
+                    "cohort_id": "Optional — filter to a specific cohort. Omit for all cohorts."
+                }
+            },
+            "get_objections_by_cohort": {
+                "name": "get_objections_by_cohort",
+                "description": "[Objections by Cohort] All confusion signals grouped by persona type, ranked by frequency. Returns the exact friction quotes from agents. Call this to find specific copy or UX issues to fix.",
+                "parameters": {}
+            },
         }
     
     def _execute_tool(self, tool_name: str, parameters: Dict[str, Any], report_context: str = "") -> str:
@@ -1024,6 +1088,30 @@ class ReportAgent:
                 )
                 return result.to_text()
             
+            # ── PufferFish traversal tools ──
+
+            elif tool_name == "get_dropout_funnel":
+                cohort_id = parameters.get("cohort_id") or None
+                result = self.graph_tools.get_dropout_funnel(
+                    simulation_id=self.simulation_id,
+                    cohort_id=cohort_id,
+                )
+                return json.dumps(result, ensure_ascii=False, indent=2)
+
+            elif tool_name == "get_comprehension_heatmap":
+                cohort_id = parameters.get("cohort_id") or None
+                result = self.graph_tools.get_comprehension_heatmap(
+                    simulation_id=self.simulation_id,
+                    cohort_id=cohort_id,
+                )
+                return json.dumps(result, ensure_ascii=False, indent=2)
+
+            elif tool_name == "get_objections_by_cohort":
+                result = self.graph_tools.get_objections_by_cohort(
+                    simulation_id=self.simulation_id,
+                )
+                return json.dumps(result, ensure_ascii=False, indent=2)
+
             # ========== Backward Compatibility: Old Tools (Internal Redirect to New Tools) ==========
 
             elif tool_name == "search_graph":
@@ -1167,15 +1255,33 @@ class ReportAgent:
         if progress_callback:
             progress_callback("planning", 30, "Generating report outline...")
         
-        system_prompt = PLAN_SYSTEM_PROMPT
-        user_prompt = PLAN_USER_PROMPT_TEMPLATE.format(
-            simulation_requirement=self.simulation_requirement,
-            total_nodes=context.get('graph_statistics', {}).get('total_nodes', 0),
-            total_edges=context.get('graph_statistics', {}).get('total_edges', 0),
-            entity_types=list(context.get('graph_statistics', {}).get('entity_types', {}).keys()),
-            total_entities=context.get('total_entities', 0),
-            related_facts_json=json.dumps(context.get('related_facts', [])[:10], ensure_ascii=False, indent=2),
-        )
+        if self.mode == "traversal":
+            system_prompt = TRAVERSAL_PLAN_SYSTEM_PROMPT
+            # For traversal mode, seed the planner with dropout + comprehension data
+            try:
+                funnel_data = self.graph_tools.get_dropout_funnel(self.simulation_id)
+                heatmap_data = self.graph_tools.get_comprehension_heatmap(self.simulation_id)
+                seed_json = json.dumps({
+                    "dropout_funnel": funnel_data.get("funnel", []),
+                    "comprehension_heatmap": heatmap_data.get("heatmap", []),
+                }, ensure_ascii=False, indent=2)
+            except Exception:
+                seed_json = "{}"
+            user_prompt = (
+                f"Success metric: {self.simulation_requirement}\n\n"
+                f"Simulation data preview:\n{seed_json}\n\n"
+                "Design the PM report outline based on this data."
+            )
+        else:
+            system_prompt = PLAN_SYSTEM_PROMPT
+            user_prompt = PLAN_USER_PROMPT_TEMPLATE.format(
+                simulation_requirement=self.simulation_requirement,
+                total_nodes=context.get('graph_statistics', {}).get('total_nodes', 0),
+                total_edges=context.get('graph_statistics', {}).get('total_edges', 0),
+                entity_types=list(context.get('graph_statistics', {}).get('entity_types', {}).keys()),
+                total_entities=context.get('total_entities', 0),
+                related_facts_json=json.dumps(context.get('related_facts', [])[:10], ensure_ascii=False, indent=2),
+            )
 
         try:
             response = self.llm.chat_json(

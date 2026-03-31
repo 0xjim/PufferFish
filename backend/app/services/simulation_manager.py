@@ -45,32 +45,37 @@ class SimulationState:
     simulation_id: str
     project_id: str
     graph_id: str
-    
+
     # Platform enabled state
     enable_twitter: bool = True
     enable_reddit: bool = True
-    
+
+    # Simulation mode: "oasis" (default) or "traversal" (PufferFish)
+    mode: str = "oasis"
+    cohort_id: Optional[str] = None      # e.g. "defi"
+    metric: Optional[str] = None         # success metric for traversal mode
+
     # Status
     status: SimulationStatus = SimulationStatus.CREATED
-    
+
     # Preparation phase data
     entities_count: int = 0
     profiles_count: int = 0
     entity_types: List[str] = field(default_factory=list)
-    
+
     # Config generation information
     config_generated: bool = False
     config_reasoning: str = ""
-    
+
     # Runtime data
     current_round: int = 0
     twitter_status: str = "not_started"
     reddit_status: str = "not_started"
-    
+
     # Timestamps
     created_at: str = field(default_factory=lambda: datetime.now().isoformat())
     updated_at: str = field(default_factory=lambda: datetime.now().isoformat())
-    
+
     # Error message
     error: Optional[str] = None
     
@@ -82,6 +87,9 @@ class SimulationState:
             "graph_id": self.graph_id,
             "enable_twitter": self.enable_twitter,
             "enable_reddit": self.enable_reddit,
+            "mode": self.mode,
+            "cohort_id": self.cohort_id,
+            "metric": self.metric,
             "status": self.status.value,
             "entities_count": self.entities_count,
             "profiles_count": self.profiles_count,
@@ -173,6 +181,9 @@ class SimulationManager:
             graph_id=data.get("graph_id", ""),
             enable_twitter=data.get("enable_twitter", True),
             enable_reddit=data.get("enable_reddit", True),
+            mode=data.get("mode", "oasis"),
+            cohort_id=data.get("cohort_id"),
+            metric=data.get("metric"),
             status=SimulationStatus(data.get("status", "created")),
             entities_count=data.get("entities_count", 0),
             profiles_count=data.get("profiles_count", 0),
@@ -226,6 +237,83 @@ class SimulationManager:
         
         return state
     
+    def create_traversal_simulation(
+        self,
+        project_id: str,
+        cohort_id: str,
+        screens_data: List[Dict],
+        metric: str = "task completion",
+        graph_id: str = "",
+    ) -> SimulationState:
+        """
+        Create a traversal-mode simulation (PufferFish).
+
+        Writes screens.json and personas.json to the simulation directory,
+        sets mode="traversal", and marks status=READY (no preparation step needed).
+
+        Args:
+            project_id: Project ID (can be empty string if coming from skill)
+            cohort_id: Persona library to use, e.g. "defi"
+            screens_data: List of screen dicts (from ScreenExtractor or manual)
+            metric: Success metric description
+            graph_id: Optional graph ID if product docs were uploaded
+
+        Returns:
+            SimulationState with mode="traversal" and status=READY
+        """
+        import uuid
+        simulation_id = f"sim_{uuid.uuid4().hex[:12]}"
+
+        state = SimulationState(
+            simulation_id=simulation_id,
+            project_id=project_id,
+            graph_id=graph_id,
+            enable_twitter=False,
+            enable_reddit=False,
+            mode="traversal",
+            cohort_id=cohort_id,
+            metric=metric,
+            status=SimulationStatus.CREATED,
+        )
+
+        sim_dir = self._get_simulation_dir(simulation_id)
+
+        # Write screens
+        screens_path = os.path.join(sim_dir, "screens.json")
+        with open(screens_path, "w", encoding="utf-8") as f:
+            json.dump(screens_data, f, ensure_ascii=False, indent=2)
+
+        # Load and write personas from library
+        personas = self._load_persona_library(cohort_id)
+        personas_path = os.path.join(sim_dir, "personas.json")
+        with open(personas_path, "w", encoding="utf-8") as f:
+            json.dump(personas, f, ensure_ascii=False, indent=2)
+
+        state.profiles_count = len(personas)
+        state.status = SimulationStatus.READY
+        state.config_generated = True
+
+        self._save_simulation_state(state)
+        logger.info(
+            f"Create traversal simulation: {simulation_id}, "
+            f"cohort={cohort_id}, screens={len(screens_data)}, agents={len(personas)}"
+        )
+        return state
+
+    def _load_persona_library(self, cohort_id: str) -> List[Dict]:
+        """Load persona library JSON from backend/personas/{cohort_id}.json."""
+        library_path = os.path.join(
+            os.path.dirname(__file__),
+            f"../../personas/{cohort_id}.json"
+        )
+        if not os.path.exists(library_path):
+            raise ValueError(
+                f"Persona library not found: '{cohort_id}'. "
+                f"Available libraries: defi, saas_b2b, devtools, consumer"
+            )
+        with open(library_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+
     def prepare_simulation(
         self,
         simulation_id: str,

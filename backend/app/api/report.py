@@ -47,17 +47,24 @@ def generate_report():
                     "already_generated": True
                 }})
 
-        project = ProjectManager.get_project(state.project_id)
-        if not project:
-            return jsonify({"success": False, "error": f"Project does not exist: {state.project_id}"}), 404
+        # Traversal mode: project may be absent; metric lives in state.metric
+        sim_mode = getattr(state, 'mode', 'oasis')
 
-        graph_id = state.graph_id or project.graph_id
-        if not graph_id:
-            return jsonify({"success": False, "error": "Missing graph ID, please ensure graph is built"}), 400
+        if sim_mode == "traversal":
+            graph_id = state.graph_id or ""
+            simulation_requirement = state.metric or "task completion"
+        else:
+            project = ProjectManager.get_project(state.project_id)
+            if not project:
+                return jsonify({"success": False, "error": f"Project does not exist: {state.project_id}"}), 404
 
-        simulation_requirement = project.simulation_requirement
-        if not simulation_requirement:
-            return jsonify({"success": False, "error": "Missing simulation requirement description"}), 400
+            graph_id = state.graph_id or project.graph_id
+            if not graph_id:
+                return jsonify({"success": False, "error": "Missing graph ID, please ensure graph is built"}), 400
+
+            simulation_requirement = project.simulation_requirement
+            if not simulation_requirement:
+                return jsonify({"success": False, "error": "Missing simulation requirement description"}), 400
 
         import uuid
         report_id = f"report_{uuid.uuid4().hex[:12]}"
@@ -82,7 +89,8 @@ def generate_report():
                     graph_id=graph_id,
                     simulation_id=simulation_id,
                     simulation_requirement=simulation_requirement,
-                    graph_tools=graph_tools
+                    graph_tools=graph_tools,
+                    mode=sim_mode,
                 )
                 def progress_callback(stage, progress, message):
                     task_manager.update_task(task_id, progress=progress, message=f"[{stage}] {message}")
@@ -239,15 +247,18 @@ def chat_with_report_agent():
         if not state:
             return jsonify({"success": False, "error": f"Simulation does not exist: {simulation_id}"}), 404
 
-        project = ProjectManager.get_project(state.project_id)
-        if not project:
-            return jsonify({"success": False, "error": f"Project does not exist: {state.project_id}"}), 404
-
-        graph_id = state.graph_id or project.graph_id
-        if not graph_id:
-            return jsonify({"success": False, "error": "Missing graph ID"}), 400
-
-        simulation_requirement = project.simulation_requirement or ""
+        chat_sim_mode = getattr(state, 'mode', 'oasis')
+        if chat_sim_mode == "traversal":
+            graph_id = state.graph_id or ""
+            simulation_requirement = state.metric or "task completion"
+        else:
+            project = ProjectManager.get_project(state.project_id)
+            if not project:
+                return jsonify({"success": False, "error": f"Project does not exist: {state.project_id}"}), 404
+            graph_id = state.graph_id or project.graph_id
+            if not graph_id:
+                return jsonify({"success": False, "error": "Missing graph ID"}), 400
+            simulation_requirement = project.simulation_requirement or ""
 
         storage = current_app.extensions.get('neo4j_storage')
         if not storage:
@@ -258,7 +269,8 @@ def chat_with_report_agent():
             graph_id=graph_id,
             simulation_id=simulation_id,
             simulation_requirement=simulation_requirement,
-            graph_tools=graph_tools
+            graph_tools=graph_tools,
+            mode=chat_sim_mode,
         )
 
         result = agent.chat(message=message, chat_history=chat_history)

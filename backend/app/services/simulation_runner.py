@@ -335,7 +335,16 @@ class SimulationRunner:
         existing = cls.get_run_state(simulation_id)
         if existing and existing.runner_status in [RunnerStatus.RUNNING, RunnerStatus.STARTING]:
             raise ValueError(f"Simulation already running: {simulation_id}")
-        
+
+        # Check mode — traversal simulations bypass OASIS entirely
+        sim_dir = os.path.join(cls.RUN_STATE_DIR, simulation_id)
+        state_file = os.path.join(sim_dir, "state.json")
+        if os.path.exists(state_file):
+            with open(state_file, 'r', encoding='utf-8') as _f:
+                _state_data = json.load(_f)
+            if _state_data.get("mode") == "traversal":
+                return cls._start_traversal(simulation_id, storage=storage)
+
         # Load simulation config
         sim_dir = os.path.join(cls.RUN_STATE_DIR, simulation_id)
         config_path = os.path.join(sim_dir, "simulation_config.json")
@@ -477,6 +486,114 @@ class SimulationRunner:
         
         return state
     
+    @classmethod
+    def _start_traversal(
+        cls,
+        simulation_id: str,
+        storage=None,
+    ) -> "SimulationRunState":
+        """
+        Start a PufferFish traversal simulation (replaces OASIS for product testing).
+
+        Loads screens.json and personas.json from the simulation directory,
+        runs TraversalEngine in a background thread, and updates SimulationRunState
+        after every event so the polling endpoint shows live progress.
+        """
+        from ..engines.traversal import TraversalEngine
+        from ..utils.llm_client import LLMClient
+
+        sim_dir = os.path.join(cls.RUN_STATE_DIR, simulation_id)
+
+        screens_path = os.path.join(sim_dir, "screens.json")
+        personas_path = os.path.join(sim_dir, "personas.json")
+        state_path = os.path.join(sim_dir, "state.json")
+
+        if not os.path.exists(screens_path):
+            raise ValueError(f"screens.json not found for simulation {simulation_id}")
+        if not os.path.exists(personas_path):
+            raise ValueError(f"personas.json not found for simulation {simulation_id}")
+
+        with open(screens_path, 'r', encoding='utf-8') as f:
+            screens = json.load(f)
+        with open(personas_path, 'r', encoding='utf-8') as f:
+            personas = json.load(f)
+
+        metric = "task completion"
+        if os.path.exists(state_path):
+            with open(state_path, 'r', encoding='utf-8') as f:
+                metric = json.load(f).get("metric") or "task completion"
+
+        total = len(personas) * len(screens)
+
+        run_state = SimulationRunState(
+            simulation_id=simulation_id,
+            runner_status=RunnerStatus.STARTING,
+            total_rounds=total,          # screens × agents = total events
+            started_at=datetime.now().isoformat(),
+            twitter_running=True,        # proxy: "traversal running"
+        )
+        cls._save_run_state(run_state)
+
+        try:
+            llm_client = LLMClient()
+        except Exception as e:
+            run_state.runner_status = RunnerStatus.FAILED
+            run_state.error = str(e)
+            cls._save_run_state(run_state)
+            raise
+
+        engine = TraversalEngine(
+            simulation_id=simulation_id,
+            screens=screens,
+            personas=personas,
+            llm_client=llm_client,
+            metric=metric,
+        )
+
+        def _run():
+            run_state.runner_status = RunnerStatus.RUNNING
+            cls._save_run_state(run_state)
+
+            def _on_event(events_done: int, total: int, message: str):
+                run_state.twitter_actions_count = events_done   # proxy for events_count
+                run_state.current_round = events_done
+                run_state.updated_at = datetime.now().isoformat()
+                # Add a lightweight action entry so the frontend feed shows activity
+                run_state.recent_actions.insert(0, AgentAction(
+                    round_num=events_done,
+                    timestamp=run_state.updated_at,
+                    platform="traversal",
+                    agent_id=0,
+                    agent_name=message,
+                    action_type="TRAVERSAL_EVENT",
+                    success=True,
+                ))
+                if len(run_state.recent_actions) > run_state.max_recent_actions:
+                    run_state.recent_actions = run_state.recent_actions[:run_state.max_recent_actions]
+                cls._save_run_state(run_state)
+
+            try:
+                engine.run(progress_callback=_on_event)
+                run_state.runner_status = RunnerStatus.COMPLETED
+                run_state.twitter_running = False
+                run_state.twitter_completed = True
+                run_state.completed_at = datetime.now().isoformat()
+                logger.info(f"Traversal simulation completed: {simulation_id}")
+            except Exception as exc:
+                run_state.runner_status = RunnerStatus.FAILED
+                run_state.error = str(exc)
+                run_state.twitter_running = False
+                logger.error(f"Traversal simulation failed: {simulation_id} — {exc}")
+            finally:
+                cls._save_run_state(run_state)
+
+        thread = threading.Thread(target=_run, daemon=True, name=f"traversal-{simulation_id}")
+        thread.start()
+        cls._monitor_threads[simulation_id] = thread
+        logger.info(f"Traversal simulation started: {simulation_id}, agents={len(personas)}, screens={len(screens)}")
+
+        return run_state
+
     @classmethod
     def _monitor_simulation(cls, simulation_id: str):
         """Monitor simulation process and parse action logs"""

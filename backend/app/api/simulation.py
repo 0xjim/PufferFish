@@ -13,6 +13,8 @@ from ..services.entity_reader import EntityReader
 from ..services.oasis_profile_generator import OasisProfileGenerator
 from ..services.simulation_manager import SimulationManager, SimulationStatus
 from ..services.simulation_runner import SimulationRunner, RunnerStatus
+from ..services.screen_extractor import ScreenExtractor
+from ..utils.llm_client import LLMClient
 from ..utils.logger import get_logger
 from ..models.project import ProjectManager
 
@@ -227,6 +229,140 @@ def create_simulation():
         }), 500
 
 
+@simulation_bp.route('/create-from-description', methods=['POST'])
+def create_simulation_from_description():
+    """
+    PufferFish: Create a traversal simulation from a plain-text feature description.
+
+    Request (JSON):
+        {
+            "description": "...",    // PRD text or feature description (required)
+            "metric": "...",         // Success metric, e.g. "conversion rate" (required)
+            "cohort_id": "defi",     // Persona library: defi | saas_b2b | devtools | consumer (required)
+            "project_id": "..."      // Optional — links to an existing graph
+        }
+
+    Returns:
+        {
+            "simulation_id": "sim_xxx",
+            "screens": [...],        // Extracted screens for user review
+            "personas": [...],       // Persona names + tasks
+            "screen_count": 5,
+            "agent_count": 4,
+            "estimated_minutes": 3
+        }
+    """
+    try:
+        data = request.get_json() or {}
+
+        description = (data.get('description') or '').strip()
+        if not description:
+            return jsonify({"success": False, "error": "Please provide 'description'"}), 400
+
+        metric = (data.get('metric') or 'task completion').strip()
+        cohort_id = (data.get('cohort_id') or '').strip()
+        if not cohort_id:
+            return jsonify({"success": False, "error": "Please provide 'cohort_id' (e.g. 'defi')"}), 400
+
+        project_id = (data.get('project_id') or '').strip()
+        graph_id = ''
+        if project_id:
+            project = ProjectManager.get_project(project_id)
+            if project:
+                graph_id = project.graph_id or ''
+
+        # Extract screens from description
+        llm_client = LLMClient()
+        extractor = ScreenExtractor(llm_client)
+        screens = extractor.extract_screens(description, metric)
+
+        # Create traversal simulation
+        manager = SimulationManager()
+        state = manager.create_traversal_simulation(
+            project_id=project_id,
+            cohort_id=cohort_id,
+            screens_data=screens,
+            metric=metric,
+            graph_id=graph_id,
+        )
+
+        # Load personas for preview
+        personas_preview = []
+        try:
+            personas_full = manager._load_persona_library(cohort_id)
+            personas_preview = [
+                {"agent_id": p.get("agent_id"), "name": p.get("name"), "task": p.get("task")}
+                for p in personas_full
+            ]
+        except Exception:
+            pass
+
+        agent_count = len(personas_preview)
+        screen_count = len(screens)
+        # Rough estimate: ~1 min per agent per screen at moderate LLM latency
+        estimated_minutes = max(1, round(agent_count * screen_count * 0.25))
+
+        return jsonify({
+            "success": True,
+            "simulation_id": state.simulation_id,
+            "screens": screens,
+            "personas": personas_preview,
+            "screen_count": screen_count,
+            "agent_count": agent_count,
+            "estimated_minutes": estimated_minutes,
+        })
+
+    except Exception as e:
+        logger.error(f"Failed to create traversal simulation: {str(e)}")
+        return jsonify({
+            "success": False,
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        }), 500
+
+
+@simulation_bp.route('/<simulation_id>/traversal-events', methods=['GET'])
+def get_traversal_events(simulation_id: str):
+    """
+    PufferFish: Return all traversal events logged for a simulation.
+
+    Returns:
+        {"success": true, "events": [...], "summary": {...}}
+    """
+    import json as _json
+
+    sim_dir = os.path.join(Config.OASIS_SIMULATION_DATA_DIR, simulation_id)
+    events_path = os.path.join(sim_dir, "traversal_events.jsonl")
+    summary_path = os.path.join(sim_dir, "traversal_summary.json")
+
+    if not os.path.exists(sim_dir):
+        return jsonify({"success": False, "error": "Simulation not found"}), 404
+
+    events = []
+    if os.path.exists(events_path):
+        with open(events_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        events.append(_json.loads(line))
+                    except _json.JSONDecodeError:
+                        pass
+
+    summary = {}
+    if os.path.exists(summary_path):
+        with open(summary_path, 'r', encoding='utf-8') as f:
+            summary = _json.load(f)
+
+    return jsonify({
+        "success": True,
+        "simulation_id": simulation_id,
+        "events": events,
+        "event_count": len(events),
+        "summary": summary,
+    })
+
+
 def _check_simulation_prepared(simulation_id: str) -> tuple:
     """
     Check if simulation is ready
@@ -246,12 +382,31 @@ def _check_simulation_prepared(simulation_id: str) -> tuple:
     import os
     from ..config import Config
     
+    import json as _json
     simulation_dir = os.path.join(Config.OASIS_SIMULATION_DATA_DIR, simulation_id)
-    
+
     # Check if directory exists
     if not os.path.exists(simulation_dir):
         return False, {"reason": "Simulation directory does not exist"}
-    
+
+    # Traversal mode — different required files
+    state_file_early = os.path.join(simulation_dir, "state.json")
+    if os.path.exists(state_file_early):
+        with open(state_file_early, 'r', encoding='utf-8') as _f:
+            _mode_data = _json.load(_f)
+        if _mode_data.get("mode") == "traversal":
+            for fname in ("screens.json", "personas.json"):
+                if not os.path.exists(os.path.join(simulation_dir, fname)):
+                    return False, {"reason": f"Missing traversal file: {fname}"}
+            status = _mode_data.get("status", "")
+            if status not in ("ready", "running", "completed", "stopped"):
+                return False, {"reason": f"Traversal simulation not ready: status={status}"}
+            return True, {
+                "mode": "traversal",
+                "cohort_id": _mode_data.get("cohort_id"),
+                "status": status,
+            }
+
     # Required file list (scripts not included, scripts are in backend/scripts/)
     required_files = [
         "state.json",

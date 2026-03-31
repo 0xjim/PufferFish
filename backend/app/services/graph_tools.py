@@ -11,6 +11,7 @@ Core Retrieval Tools (Optimized):
 """
 
 import json
+import os
 from typing import Dict, Any, List, Optional
 from dataclasses import dataclass, field
 
@@ -1494,3 +1495,179 @@ Please generate an interview summary."""
         except Exception as e:
             logger.warning(f"Failed to generate interview summary: {e}")
             return f"Interviewed {len(interviews)} interviewees, including: " + ", ".join([i.agent_name for i in interviews])
+
+    # ------------------------------------------------------------------
+    # PufferFish traversal analysis tools
+    # ------------------------------------------------------------------
+
+    def _load_traversal_events(self, simulation_id: str) -> List[Dict[str, Any]]:
+        """Load all traversal events from traversal_events.jsonl for a simulation."""
+        from ..config import Config
+        events_path = os.path.join(Config.OASIS_SIMULATION_DATA_DIR, simulation_id, "traversal_events.jsonl")
+        events = []
+        if not os.path.exists(events_path):
+            return events
+        with open(events_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        events.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        pass
+        return events
+
+    def get_dropout_funnel(
+        self,
+        simulation_id: str,
+        cohort_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        [Dropout Funnel] Screen-by-screen abandonment rates.
+
+        Returns the percentage of agents who abandoned at each screen,
+        showing where users drop out of the product flow.
+
+        Args:
+            simulation_id: The simulation to analyse.
+            cohort_id: Optional — filter to agents from this cohort.
+        """
+        events = self._load_traversal_events(simulation_id)
+        if cohort_id:
+            events = [e for e in events if e.get("cohort") == cohort_id]
+
+        # Collect per-screen stats in order of first appearance
+        screen_order: List[str] = []
+        screen_names: Dict[str, str] = {}
+        reached: Dict[str, set] = {}
+        abandoned: Dict[str, set] = {}
+
+        for e in events:
+            sid = e.get("screen_id", "unknown")
+            agent = e.get("agent_id", "unknown")
+            if sid not in screen_order:
+                screen_order.append(sid)
+                screen_names[sid] = e.get("screen_name", sid)
+                reached[sid] = set()
+                abandoned[sid] = set()
+            reached[sid].add(agent)
+            if e.get("action_taken") == "abandon":
+                abandoned[sid].add(agent)
+
+        funnel = []
+        for sid in screen_order:
+            r = len(reached[sid])
+            a = len(abandoned[sid])
+            funnel.append({
+                "screen_id": sid,
+                "screen_name": screen_names[sid],
+                "agents_reached": r,
+                "agents_abandoned": a,
+                "dropout_rate": round(a / r, 2) if r else 0,
+            })
+
+        return {
+            "simulation_id": simulation_id,
+            "cohort_id": cohort_id,
+            "funnel": funnel,
+            "total_events": len(events),
+        }
+
+    def get_comprehension_heatmap(
+        self,
+        simulation_id: str,
+        cohort_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        [Comprehension Heatmap] Average comprehension and trust scores per screen per cohort.
+
+        Reveals which screens confuse which user segments.
+
+        Args:
+            simulation_id: The simulation to analyse.
+            cohort_id: Optional — filter to a specific cohort.
+        """
+        events = self._load_traversal_events(simulation_id)
+        if cohort_id:
+            events = [e for e in events if e.get("cohort") == cohort_id]
+
+        # {screen_id: {cohort: {scores, trusts}}}
+        data: Dict[str, Dict[str, Dict]] = {}
+        screen_names: Dict[str, str] = {}
+
+        for e in events:
+            sid = e.get("screen_id", "unknown")
+            cohort = e.get("cohort", "unknown")
+            screen_names[sid] = e.get("screen_name", sid)
+
+            if sid not in data:
+                data[sid] = {}
+            if cohort not in data[sid]:
+                data[sid][cohort] = {"comprehension": [], "trust": []}
+
+            try:
+                data[sid][cohort]["comprehension"].append(int(e.get("comprehension_score", 3)))
+                data[sid][cohort]["trust"].append(int(e.get("trust_score", 3)))
+            except (TypeError, ValueError):
+                pass
+
+        heatmap = []
+        for sid, cohorts in data.items():
+            row = {"screen_id": sid, "screen_name": screen_names.get(sid, sid), "cohorts": {}}
+            for cohort, scores in cohorts.items():
+                c = scores["comprehension"]
+                t = scores["trust"]
+                row["cohorts"][cohort] = {
+                    "avg_comprehension": round(sum(c) / len(c), 2) if c else 0,
+                    "avg_trust": round(sum(t) / len(t), 2) if t else 0,
+                    "n_agents": len(c),
+                }
+            heatmap.append(row)
+
+        return {
+            "simulation_id": simulation_id,
+            "cohort_id": cohort_id,
+            "heatmap": heatmap,
+        }
+
+    def get_objections_by_cohort(
+        self,
+        simulation_id: str,
+    ) -> Dict[str, Any]:
+        """
+        [Objections by Cohort] Confusion signals grouped by persona cohort.
+
+        Returns all friction quotes per cohort, ranked by frequency,
+        revealing what different user segments struggle with.
+
+        Args:
+            simulation_id: The simulation to analyse.
+        """
+        from collections import Counter
+
+        events = self._load_traversal_events(simulation_id)
+
+        # {cohort: [confusion_signal, ...]}
+        cohort_signals: Dict[str, List[str]] = {}
+
+        for e in events:
+            signal = (e.get("confusion_signal") or "").strip()
+            if not signal or signal.startswith("["):  # skip blank / system entries
+                continue
+            cohort = e.get("cohort", "unknown")
+            if cohort not in cohort_signals:
+                cohort_signals[cohort] = []
+            cohort_signals[cohort].append(signal)
+
+        result = {}
+        for cohort, signals in cohort_signals.items():
+            counts = Counter(signals)
+            result[cohort] = [
+                {"confusion_signal": sig, "frequency": count}
+                for sig, count in counts.most_common(20)
+            ]
+
+        return {
+            "simulation_id": simulation_id,
+            "objections_by_cohort": result,
+        }
